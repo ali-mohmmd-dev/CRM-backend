@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -44,7 +45,7 @@ INSTALLED_APPS = [
     'drf_spectacular',
     
     # Local apps
-    'core',
+    'core.apps.CoreConfig',
 ]
 
 MIDDLEWARE = [
@@ -151,3 +152,13 @@ SPECTACULAR_SETTINGS = {
 
 # CORS Settings
 CORS_ALLOW_ALL_ORIGINS = True # For development only
+
+# Kafka / Redpanda
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+KAFKA_CLIENT_ID = os.environ.get('KAFKA_CLIENT_ID', 'crm-backend')
+KAFKA_CONSUMER_GROUP = os.environ.get('KAFKA_CONSUMER_GROUP', 'crm-backend-handlers')
+KAFKA_TOPICS = {
+    'leads': 'crm.lead.events',
+    'customers': 'crm.customer.events',
+    'works': 'crm.work.events',
+}

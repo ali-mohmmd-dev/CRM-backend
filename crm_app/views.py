@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
 from rest_framework import generics, status, viewsets
@@ -9,10 +10,12 @@ from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
+
+from .events import EventNames, publish
 from .models import Staff, Work, Customer, Lead
 from .serializers import (
-    UserRegistrationSerializer, 
-    UserSerializer, 
+    UserRegistrationSerializer,
+    UserSerializer,
     CustomTokenObtainPairSerializer,
     CreateUserSerializer,
     StaffSerializer,
@@ -20,6 +23,18 @@ from .serializers import (
     CustomerSerializer,
     LeadSerializer,
 )
+
+
+def publish_after_commit(topic_key, event_type, organization_id, payload, *, key=None):
+    def _publish():
+        try:
+            publish(topic_key, event_type, organization_id, payload, key=key)
+        except Exception:
+            # Primary write already committed; log inside publish and continue.
+            pass
+
+    transaction.on_commit(_publish)
+
 
 class RegisterOrganizationView(generics.CreateAPIView):
     """
@@ -33,27 +48,27 @@ class RegisterOrganizationView(generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
-        
-        # Generate JWT tokens for the new user
+
         refresh = RefreshToken.for_user(user)
-        
+
         return Response({
             'user': UserSerializer(user).data,
             'refresh': str(refresh),
             'access': str(refresh.access_token),
         }, status=status.HTTP_201_CREATED)
 
+
 class CreateUserView(generics.CreateAPIView):
     """
-    API endpoint to allow an organization member (or admin) to create a new user 
+    API endpoint to allow an organization member (or admin) to create a new user
     for their own organization.
     """
     permission_classes = [IsAuthenticated]
     serializer_class = CreateUserSerializer
 
     def perform_create(self, serializer):
-        # Automatically assign the new user to the creator's organization
         serializer.save(organization=self.request.user.organization)
+
 
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
@@ -88,6 +103,56 @@ class WorkViewSet(OrganizationScopedViewSet):
     queryset = Work.objects.select_related('assigned_to')
     serializer_class = WorkSerializer
 
+    def perform_create(self, serializer):
+        work = serializer.save(organization=self.request.user.organization)
+        publish_after_commit(
+            'works',
+            EventNames.WORK_CREATED,
+            work.organization_id,
+            {
+                'work_id': work.id,
+                'organization_id': work.organization_id,
+                'title': work.title,
+                'status': work.status,
+                'assigned_to_id': work.assigned_to_id,
+            },
+            key=str(work.id),
+        )
+
+    def perform_update(self, serializer):
+        previous = self.get_object()
+        previous_assigned_to_id = previous.assigned_to_id
+        previous_status = previous.status
+        work = serializer.save()
+
+        if previous_assigned_to_id != work.assigned_to_id:
+            publish_after_commit(
+                'works',
+                EventNames.WORK_ASSIGNED,
+                work.organization_id,
+                {
+                    'work_id': work.id,
+                    'organization_id': work.organization_id,
+                    'assigned_to_id': work.assigned_to_id,
+                    'previous_assigned_to_id': previous_assigned_to_id,
+                },
+                key=str(work.id),
+            )
+
+        if previous_status != work.status:
+            publish_after_commit(
+                'works',
+                EventNames.WORK_STATUS_CHANGED,
+                work.organization_id,
+                {
+                    'work_id': work.id,
+                    'organization_id': work.organization_id,
+                    'status': work.status,
+                    'previous_status': previous_status,
+                },
+                key=str(work.id),
+            )
+
 
 class CustomerViewSet(OrganizationScopedViewSet):
     queryset = Customer.objects.all()
@@ -98,6 +163,17 @@ class CustomerViewSet(OrganizationScopedViewSet):
         customer = self.get_object()
         customer.last_contact = timezone.localdate()
         customer.save(update_fields=['last_contact', 'updated_at'])
+        publish_after_commit(
+            'customers',
+            EventNames.CUSTOMER_FOLLOWED_UP,
+            customer.organization_id,
+            {
+                'customer_id': customer.id,
+                'organization_id': customer.organization_id,
+                'last_contact': customer.last_contact.isoformat(),
+            },
+            key=str(customer.id),
+        )
         return Response(self.get_serializer(customer).data)
 
 
@@ -113,26 +189,42 @@ class LeadViewSet(OrganizationScopedViewSet):
         if lead.status == Lead.STATUS_NEW:
             lead.status = Lead.STATUS_CONTACTED
         lead.save(update_fields=['called', 'called_at', 'status', 'updated_at'])
+        publish_after_commit(
+            'leads',
+            EventNames.LEAD_CALLED,
+            lead.organization_id,
+            {
+                'lead_id': lead.id,
+                'organization_id': lead.organization_id,
+                'status': lead.status,
+                'called_at': lead.called_at.isoformat(),
+            },
+            key=str(lead.id),
+        )
         return Response(self.get_serializer(lead).data)
 
     @action(detail=True, methods=['post'], url_path='convert-to-customer')
     def convert_to_customer(self, request, pk=None):
         lead = self.get_object()
-        customer, _ = Customer.objects.get_or_create(
-            organization=lead.organization,
-            email=lead.email,
-            defaults={
-                'name': lead.name,
-                'company': lead.company,
-                'phone': lead.phone,
-                'status': Customer.STATUS_ACTIVE,
-                'last_contact': timezone.localdate(),
-                'notes': lead.notes,
-            },
-        )
         lead.status = Lead.STATUS_CONVERTED
         lead.save(update_fields=['status', 'updated_at'])
-        return Response(CustomerSerializer(customer).data, status=status.HTTP_201_CREATED)
+        publish_after_commit(
+            'leads',
+            EventNames.LEAD_CONVERTED,
+            lead.organization_id,
+            {
+                'lead_id': lead.id,
+                'organization_id': lead.organization_id,
+                'name': lead.name,
+                'company': lead.company,
+                'email': lead.email,
+                'phone': lead.phone,
+                'notes': lead.notes,
+                'last_contact': timezone.localdate().isoformat(),
+            },
+            key=str(lead.id),
+        )
+        return Response(LeadSerializer(lead).data, status=status.HTTP_202_ACCEPTED)
 
 
 class DashboardStatsView(APIView):
